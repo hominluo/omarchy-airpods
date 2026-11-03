@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# Call/music mode, call codec and playback codec for the connected Bluetooth
+# headphones. The panel (io.github.hominluo.airpods) and the command line
+# share this one entry point.
+#
+# Why modes exist instead of a single switch (measured 2026-09-10):
+#   WirePlumber's autoswitch flips the card profile every time an application
+#   opens or closes the microphone. Some controllers (the Apple Broadcom one in
+#   an iMac, an Intel AX201 in a Latitude) do not survive repeated flips: the
+#   link drops and the mic and playback die together.
+#   Leaving it to the watchdog in auto mode is enough most of the time. Two
+#   cases still need a human decision:
+#     call  - force HFP: build the call link before the application opens the mic.
+#     music - force A2DP: apps that hold the mic permanently (Discord, Chrome)
+#             would otherwise keep the daemon pinned at 8 kHz. The cost is that
+#             the microphone is dead while A2DP is active - the profile has no
+#             mic channel.
+#
+# The mode lives in $MODE_FILE; no file means auto. The daemon backs off
+# completely while that file exists.
+set -u
+
+# Follow whichever headphones are connected instead of pinning one MAC. The
+# flapping is a controller problem, so it applies to every pair. PipeWire only
+# creates a bluez_card for a connected audio device, so that card is the truth.
+# With two pairs connected, the first one wins; BT_CALL_MAC overrides.
+if [ -n "${BT_CALL_MAC:-}" ]; then
+  CARD=bluez_card.$(printf '%s' "$BT_CALL_MAC" | tr ':a-f' '_A-F')
+else
+  CARD=$(pactl list cards short 2>/dev/null | awk '$2 ~ /^bluez_card\./ {print $2; exit}')
+fi
+MAC_U=${CARD#bluez_card.}
+MAC_C=${MAC_U//_/:}
+AUTOSWITCH=bluetooth.autoswitch-to-headset-profile
+# The controller's SCO (isochronous) USB interface is interface 0 of hci0 moved
+# to interface 1. Resolved from hci0 rather than hard-coded: it is 1-6:1.3 on
+# the iMac and 3-10:1.1 on the Intel AX201.
+_BT_IF0=$(readlink -f /sys/class/bluetooth/hci0/device 2>/dev/null)
+USBDEV="${_BT_IF0%.0}.1/bAlternateSetting"
+BT_USB_VENDOR=$(cat "${_BT_IF0%/*}/idVendor" 2>/dev/null)
+MODE_FILE="${XDG_RUNTIME_DIR:-/tmp}/bt-call-manual"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bt-call"
+# The A2DP profile this pair uses for music. Hanging up and "music" both return
+# to it rather than to a bare a2dp-sink: a bare a2dp-sink is whatever codec
+# PipeWire picked (AAC on Galaxy Buds2), so a chosen SBC-XQ was lost on the
+# first call (2026-09-22). The panel and the daemon both write it, so a choice
+# made in another tool counts too.
+A2DP_PICK="$STATE_DIR/a2dp-$MAC_U"
+DAEMON_PID="$STATE_DIR/daemon.pid"
+
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
+dim(){ printf '\033[2m%s\033[0m\n' "$*"; }
+
+connected(){ [ -n "$MAC_C" ] && bluetoothctl info "$MAC_C" 2>/dev/null | grep -q 'Connected: yes'; }
+profile(){ pactl list cards 2>/dev/null | sed -n "/Name: $CARD\$/,/Active Profile/p" | grep -m1 'Active Profile' | sed 's/.*: //'; }
+
+# Every profile this card offers together with its codec, one "profile codec"
+# pair per line. The codec is read from the profile description
+# ("... (A2DP Sink, codec aptX) ...") instead of guessed from the name: the
+# same a2dp-sink is AAC on the AirPods and aptX on Surface Headphones.
+profiles(){
+  pactl list cards 2>/dev/null | sed -n "/Name: $CARD\$/,/Active Profile/p" \
+    | sed -nE 's/^\s*([a-z0-9_-]+): .*codec ([^)]+)\) \(.*available: yes\)$/\1 \2/p' \
+    | while read -r p c; do printf '%s %s\n' "$p" "$(printf '%s' "$c" | tr 'A-Z ' 'a-z-')"; done
+}
+codec_of(){ profiles | awk -v p="$1" '$1 == p {print $2; exit}'; }
+profile_for(){ profiles | awk -v c="$1" -v k="$2" '$2 == c && index($1, k) == 1 {print $1; exit}'; }
+codecs_of(){ profiles | awk -v k="$1" 'index($1, k) == 1 {print $2}' | paste -sd, -; }
+# The profile to return to for music: the remembered one when this connection
+# still offers it, otherwise a bare a2dp-sink.
+a2dp_home(){
+  local p
+  p=$(cat "$A2DP_PICK" 2>/dev/null)
+  if [ -n "$p" ] && profiles | awk -v p="$p" '$1 == p {f = 1} END {exit !f}'; then echo "$p"; else echo a2dp-sink; fi
+}
+alt(){ tr -d ' ' < "$USBDEV" 2>/dev/null || echo '?'; }
+cur_mode(){ [ -f "$MODE_FILE" ] && cat "$MODE_FILE" 2>/dev/null || echo auto; }
+as_saved(){ wpctl settings "$AUTOSWITCH" 2>/dev/null | grep -oE 'Saved: (true|false)' | awk '{print $2}'; }
+
+# Whether the call watchdog is running. It is started by the panel, so the
+# pidfile is the only honest answer; systemd is not involved.
+daemon_state(){
+  local pid
+  pid=$(cat "$DAEMON_PID" 2>/dev/null) || { echo inactive; return; }
+  # A pidfile outlives a killed shell, and the number can be reused, so check
+  # the command line as well.
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+     && ps -p "$pid" -o args= 2>/dev/null | grep -q 'bt-call-daemon'; then
+    echo active
+  else
+    echo inactive
+  fi
+}
+
+# Real capture node names. PipeWire changed the naming (it used to be
+# bluez_input.<underscores>.0, now bluez_input.<colons>), so resolve it rather
+# than building the string.
+resolve_src(){
+  pactl list sources short 2>/dev/null | awk '{print $2}' \
+    | grep -E "^bluez_input\.($MAC_C|$MAC_U)" | grep -v '\.monitor$' | head -1
+}
+
+# Which applications are holding the headphone microphone. Follow PipeWire's
+# links to confirm it, so a recording from the built-in mic is not counted.
+mic_users(){
+  python3 - "$MAC_C" "$MAC_U" <<'PY' 2>/dev/null
+import json, subprocess, sys
+mc, mu = sys.argv[1], sys.argv[2]
+EXCLUDE = ("peak detect", "quickshell", "pavucontrol")
+try:
+    d = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5).stdout)
+except Exception:
+    sys.exit(0)
+nodes, streams = {}, {}
+for o in d:
+    if not o.get("type", "").endswith("Node"):
+        continue
+    p = (o.get("info") or {}).get("props") or {}
+    nodes[o["id"]] = p
+    if p.get("media.class") == "Stream/Input/Audio":
+        app = p.get("application.process.binary") or p.get("application.name") or "?"
+        if not any(x in app.lower() for x in EXCLUDE):
+            streams[o["id"]] = app
+bt = {i for i, p in nodes.items()
+      if p.get("node.name", "").startswith("bluez_input.")
+      and (mc in p.get("node.name", "") or mu in p.get("node.name", ""))}
+out = []
+for o in d:
+    if not o.get("type", "").endswith("Link"):
+        continue
+    p = (o.get("info") or {}).get("props") or {}
+    if p.get("link.input.node") in streams and p.get("link.output.node") in bt:
+        out.append(streams[p["link.input.node"]])
+print(",".join(sorted(set(out))))
+PY
+}
+
+# Record a few seconds and count non-zero samples - the only check that cannot
+# lie. The target must exist first: pw-record silently falls back to the
+# default device when it does not, which used to turn a dead mic into a pass.
+verify_mic(){
+  local src wav rc
+  src=$(resolve_src)
+  if [ -z "$src" ]; then
+    red "  no headset capture node - the call link is not up"
+    return 3
+  fi
+  dim "  capture node: $src"
+  wav=$(mktemp "${TMPDIR:-/tmp}/bt-call-XXXX.wav")
+  timeout 9 pw-record --target "$src" "$wav" >/dev/null 2>&1 &
+  sleep 6; kill %1 2>/dev/null; wait 2>/dev/null
+  python3 - "$wav" <<'PY'
+import sys, wave, struct, math
+try:
+    w = wave.open(sys.argv[1]); d = w.readframes(w.getnframes()); sw = w.getsampwidth()
+    if not d:
+        print("  \033[31mno frames at all - SCO transport is down\033[0m"); sys.exit(3)
+    s = struct.unpack("<%dh" % (len(d)//2), d) if sw == 2 else struct.unpack("<%df" % (len(d)//4), d)
+    mx = 32768.0 if sw == 2 else 1.0
+    nz = sum(1 for x in s if x); peak = max(abs(x) for x in s)/mx
+    rms = math.sqrt(sum(x*x for x in s)/len(s))/mx
+    print(f"  non-zero samples {nz}/{len(s)}  peak={peak:.5f}  rms={20*math.log10(rms) if rms>0 else -999:.1f} dBFS")
+    if nz == 0:
+        print("  \033[31mdigital silence - the microphone uplink is dead\033[0m"); sys.exit(3)
+    print("  \033[32mthe microphone link is alive\033[0m")
+    if peak < 0.02:
+        print("  \033[2mnote: that level is the noise floor. Say something and run it again to prove speech arrives.\033[0m")
+    sys.exit(0)
+except SystemExit: raise
+except Exception as e:
+    print("  could not read the recording:", e); sys.exit(3)
+PY
+  rc=$?; rm -f "$wav"; return $rc
+}
+
+set_mode(){
+  local m="$1"
+  case "$m" in
+    auto)
+      rm -f "$MODE_FILE"
+      wpctl settings "$AUTOSWITCH" "$(as_saved || echo true)" >/dev/null 2>&1
+      ;;
+    call)
+      echo call > "$MODE_FILE"
+      wpctl settings "$AUTOSWITCH" false >/dev/null 2>&1
+      pactl set-card-profile "$CARD" headset-head-unit >/dev/null 2>&1
+      ;;
+    music)
+      # Autoswitch has to be off first, or an app that holds the mic
+      # (Discord, Chrome) pulls the card straight back to HFP.
+      echo music > "$MODE_FILE"
+      wpctl settings "$AUTOSWITCH" false >/dev/null 2>&1
+      pactl set-card-profile "$CARD" "$(a2dp_home)" >/dev/null 2>&1
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+case "${1:-info}" in
+  mode)
+    connected || { red "no Bluetooth headphones connected"; exit 1; }
+    case "${2:-}" in
+      auto|call|music) ;;
+      *) echo "usage: bt-call mode {auto|call|music}"; exit 2 ;;
+    esac
+    set_mode "$2" || exit 2
+    sleep 3
+    echo "mode=$(cur_mode) profile=$(profile)"
+    ;;
+
+  on)   exec "$0" mode call ;;
+  off)  exec "$0" mode auto ;;
+
+  state)
+    # Legacy interface.
+    if ! connected; then echo "absent||no"; exit 0; fi
+    m=$(cur_mode); p=$(profile)
+    echo "$([ "$m" = call ] && echo on || echo off)|$p|yes"
+    ;;
+
+  info)
+    # For the panel: one key=value per line, never records, returns in
+    # milliseconds.
+    if ! connected; then echo "connected=no"; exit 0; fi
+    prof=$(profile)
+    codec=$(codec_of "$prof")
+    echo "connected=yes"
+    echo "name=$(bluetoothctl info "$MAC_C" 2>/dev/null | sed -n 's/^\s*Alias: //p' | head -1)"
+    echo "mode=$(cur_mode)"
+    echo "profile=$prof"
+    echo "codec=$codec"
+    echo "incall=$(case "$prof" in headset-head-unit*) echo yes ;; *) echo no ;; esac)"
+    echo "alt=$(alt)"
+    echo "users=$(mic_users)"
+    echo "daemon=$(daemon_state)"
+    # Kernel quirk module (btbcm-apple-quirk-dkms) missing = mSBC links come up
+    # but are silent both ways. The panel warns when a kernel upgrade breaks the
+    # DKMS build. /sys/module exists as soon as the module is loaded, so this is
+    # a cheap check. Only Apple Broadcom controllers (USB 05ac) need it; others
+    # report n/a so the panel does not raise a false alarm.
+    if [ "$BT_USB_VENDOR" = 05ac ]; then
+      echo "quirk=$([ -d /sys/module/btbcm_apple_quirk ] && echo loaded || echo missing)"
+    else
+      echo "quirk=n/a"
+    fi
+    # The codecs this pair negotiated for this session. The panel builds its
+    # rows from these, so each pair only shows what it really supports.
+    # a2dp_pick is where a call returns to; a2dp_default is the bare
+    # a2dp-sink codec, i.e. PipeWire's own first choice.
+    echo "hfp_codecs=$(codecs_of headset-head-unit)"
+    echo "a2dp_codecs=$(codecs_of a2dp-sink)"
+    echo "a2dp_pick=$(codec_of "$(a2dp_home)")"
+    echo "a2dp_default=$(codec_of a2dp-sink)"
+    ;;
+
+  codec)
+    connected || { red "no Bluetooth headphones connected"; exit 1; }
+    case "${2:-}" in
+      # Call codec: switched only during a call, because it swaps the HFP
+      # profile itself. CVSD is the escape hatch when mSBC is broken.
+      msbc|cvsd)
+        case "$(profile)" in headset-head-unit*) ;; *) echo "not in a call; pick the call codec once the call is up"; exit 1 ;; esac
+        target=$(profile_for "$2" headset-head-unit) ;;
+      "") echo "usage: bt-call codec {$(codecs_of a2dp-sink | tr , '|') | $(codecs_of headset-head-unit | tr , '|')}"; exit 2 ;;
+      *)
+        case "$(profile)" in headset-head-unit*) echo "in a call; A2DP codecs are unavailable (pick after hanging up)"; exit 1 ;; esac
+        target=$(profile_for "$2" a2dp-sink) ;;
+    esac
+    [ -n "$target" ] || { echo "this pair does not offer $2 (available: $(codecs_of a2dp-sink) / call $(codecs_of headset-head-unit))"; exit 2; }
+    pactl set-card-profile "$CARD" "$target" 2>&1
+    case "$target" in a2dp-sink*) mkdir -p "${A2DP_PICK%/*}" && echo "$target" > "$A2DP_PICK" ;; esac
+    sleep 1
+    echo "profile=$(profile)"
+    ;;
+
+  status)
+    connected || { red "no Bluetooth headphones connected"; exit 1; }
+    bt-call info | sed 's/^/  /'
+    if case "$(profile)" in headset-head-unit*) true ;; *) false ;; esac; then
+      echo; echo "microphone check:"; verify_mic
+    else
+      echo; dim "not in a call; skipping the microphone check (A2DP has no mic channel)"
+    fi
+    ;;
+
+  fix)
+    # Recovery for a stuck call, from lightest to heaviest:
+    #   1. restart WirePlumber - clears a transport PipeWire left in ERROR
+    #   2. disconnect and reconnect this pair
+    #   3. bt-call fix hard - also power-cycles the controller (the only thing
+    #      that clears a stuck Intel SCO handle)
+    connected || { red "no Bluetooth headphones connected"; exit 1; }
+    mac=$MAC_C
+    echo "==> restarting WirePlumber"; systemctl --user restart wireplumber; sleep 3
+    echo "==> disconnecting $mac"; bluetoothctl disconnect "$mac" >/dev/null 2>&1; sleep 2
+    if [ "${2:-}" = hard ]; then
+      echo "==> resetting the controller"; bluetoothctl power off >/dev/null; sleep 3; bluetoothctl power on >/dev/null; sleep 2
+    fi
+    bluetoothctl connect "$mac" >/dev/null 2>&1
+    for _ in $(seq 1 15); do pactl list cards short 2>/dev/null | grep -q "$CARD" && break; sleep 1; done
+    pactl list cards short 2>/dev/null | grep -q "$CARD" && grn "reconnected $mac" || { red "not back: bluetoothctl connect $mac"; exit 1; }
+    ;;
+
+  *) echo "usage: bt-call {mode auto|call|music | info | state | codec <codec, no argument lists the options> | status | fix [hard]}"; exit 2 ;;
+esac

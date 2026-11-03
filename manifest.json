@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hominluo.airpods",
+  "name": "Bluetooth Headphones",
+  "version": "1.2.1",
+  "author": "Homin Luo",
+  "license": "MIT",
+  "description": "Call/music mode, call codec (mSBC/CVSD) and playback codec for any connected Bluetooth headphones (built for AirPods); shows whether the kernel mSBC fix is loaded.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bluetooth Headphones",
+    "description": "Pops up when headphones connect. Pin the call link, choose mSBC or CVSD, pick the playback codec, and see what is holding the mic.",
+    "category": "Audio",
+    "aliases": [
+      "airpods",
+      "headphones",
+      "earbuds",
+      "call-mode"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Call watchdog for Bluetooth headphones - removes the profile flapping.
+
+The problem (measured 2026-09-10):
+  WirePlumber's autoswitch moves the card to HFP when an application opens the
+  microphone and back to A2DP when it closes it. Teams web (Edge) toggles the
+  microphone throughout a call, so the link is torn down every 12-40 seconds;
+  the log shows sep2/fd0 (A2DP) and fd52 (HFP) alternating with "Failure in
+  Bluetooth audio transport". Controllers such as the Apple Broadcom one in an
+  iMac cannot survive that: the link drops and the microphone and playback die
+  together (HFP is a single bidirectional link).
+
+The approach (doing the least possible):
+  Entering a call is left to WirePlumber, which is quick and correct. This
+  daemon only pins the profile while a call is up, and releases it HOLD_SECS
+  after the microphone really went idle. That grace period is the hysteresis
+  the flapping needs.
+
+  Lock   = set bluetooth.autoswitch-to-headset-profile to false at runtime.
+  Unlock = restore the saved value and go back to the A2DP profile that was in
+           use before the call (since 2026-09-22; it used to be a bare
+           a2dp-sink, which is AAC on Galaxy Buds2 and threw away the SBC-XQ
+           the user picked).
+
+Measured afterwards: no transport failures for 60 s, the profile never moved,
+and the microphone carried 517680/571392 non-zero samples.
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+# No MAC is pinned: the flapping is a controller problem, so every pair hits
+# it. Each round re-discovers the connected bluez_card (PipeWire only creates a
+# card for a connected audio device); the rule matches bt-call: first card wins.
+AUTOSWITCH = "bluetooth.autoswitch-to-headset-profile"
+HOLD_SECS = int(os.environ.get("BT_CALL_HOLD_SECS", "20"))
+POLL = 2.0
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "bt-call")
+MANUAL_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "bt-call-manual")
+# The music profile the user picked, written by `bt-call codec` (see A2DP_PICK
+# there).
+PICK_DIR = STATE_DIR
+PID_FILE = os.path.join(STATE_DIR, "daemon.pid")
+
+# These are level meters and indicators that open the microphone for a moment,
+# not calls. Counting them as calls pins the profile at 8 kHz for no reason
+# (playback turns dull), and Omarchy's own bar Peak Detect is a flapping cause
+# in the first place - certainly not a reason to switch.
+EXCLUDE = ("peak detect", "quickshell", "pavucontrol", "pipewire-media-session")
+
+
+def log(msg):
+    print(f"[bt-call] {msg}", flush=True)
+
+
+def run(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=15).stdout
+    except Exception as e:
+        log(f"cmd failed {a}: {e}")
+        return ""
+
+
+def dump():
+    try:
+        return json.loads(run("pw-dump") or "[]")
+    except Exception:
+        return []
+
+
+def current_card():
+    for line in run("pactl", "list", "cards", "short").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[1].startswith("bluez_card."):
+            return f[1]
+    return None
+
+
+def is_bt_source(props, card):
+    mac_u = card[len("bluez_card."):]
+    n = props.get("node.name", "")
+    return n.startswith("bluez_input.") and (mac_u in n or mac_u.replace("_", ":") in n)
+
+
+def mic_users(d, card):
+    """Applications currently holding the headphone microphone.
+
+    Only real application capture streams count, and a PipeWire link must
+    confirm that the stream is connected to this headset's source; otherwise a
+    recording from the built-in mic looks like a call. WirePlumber's own
+    Stream/Input/Audio/Internal stream is excluded (it exists all the time, so
+    counting it would mean never releasing).
+    """
+    nodes, streams = {}, {}
+    for o in d:
+        if not o.get("type", "").endswith("Node"):
+            continue
+        info = o.get("info") or {}
+        p = info.get("props") or {}
+        nodes[o["id"]] = p
+        if p.get("media.class") == "Stream/Input/Audio":
+            app = (p.get("application.process.binary")
+                   or p.get("application.name") or "?")
+            if any(x in app.lower() for x in EXCLUDE):
+                continue
+            streams[o["id"]] = app
+    if not streams:
+        return []
+    bt_ids = {i for i, p in nodes.items() if is_bt_source(p, card)}
+    users = []
+    for o in d:
+        if not o.get("type", "").endswith("Link"):
+            continue
+        p = (o.get("info") or {}).get("props") or {}
+        i_id, o_id = p.get("link.input.node"), p.get("link.output.node")
+        if i_id in streams and o_id in bt_ids:
+            users.append(streams[i_id])
+    return sorted(set(users))
+
+
+def profile(card):
+    if not card:
+        return None
+    out = run("pactl", "list", "cards")
+    blk = out.split(f"Name: {card}\n")
+    if len(blk) < 2:
+        return None
+    for line in blk[1].splitlines():
+        if "Active Profile:" in line:
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def offered(card):
+    """The profile names this connection offers."""
+    out = run("pactl", "list", "cards")
+    blk = out.split(f"Name: {card}\n")
+    if len(blk) < 2:
+        return set()
+    names = set()
+    for line in blk[1].split("Active Profile:")[0].splitlines():
+        line = line.strip()
+        if line.endswith("available: yes)") and ": " in line:
+            names.add(line.split(":", 1)[0])
+    return names
+
+
+def a2dp_home(card, before_call):
+    """Where to return after a call: the pre-call profile, else the picked one,
+    else a bare a2dp-sink."""
+    try:
+        with open(os.path.join(PICK_DIR, "a2dp-" + card[len("bluez_card."):])) as f:
+            pick = f.read().strip()
+    except OSError:
+        pick = ""
+    have = offered(card)
+    for p in (before_call, pick):
+        if p and p.startswith("a2dp-sink") and p in have:
+            return p
+    return "a2dp-sink"
+
+
+def autoswitch_saved():
+    out = run("wpctl", "settings", AUTOSWITCH)
+    return "true" if "Saved: true" in out else "false"
+
+
+def set_autoswitch(v):
+    run("wpctl", "settings", AUTOSWITCH, v)
+
+
+def set_profile(card, p):
+    run("pactl", "set-card-profile", card, p)
+
+
+def autoswitch_now():
+    out = run("wpctl", "settings", AUTOSWITCH)
+    return "true" if "Value: true" in out else "false"
+
+
+def take_singleton_lock():
+    """Only one watchdog per session.
+
+    The panel starts the daemon when the bar widget loads. A shell reload can
+    start the replacement before the old child is gone, and two watchdogs would
+    fight over the same runtime flag. An exclusive flock on a state file makes
+    the second one exit quietly.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(os.path.join(STATE_DIR, "daemon.lock"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def write_pid():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def clear_pid():
+    try:
+        with open(PID_FILE) as f:
+            if f.read().strip() == str(os.getpid()):
+                os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def main():
+    log(f"started (hold={HOLD_SECS}s, poll={POLL}s)")
+    # Reconcile at startup: if the previous watchdog was killed while locked,
+    # autoswitch stays false and the profile stays at 8 kHz call quality
+    # forever. Reading the real runtime value as the initial state lets the
+    # grace period release it normally instead of leaving a lock nobody owns.
+    misses = 0
+    locked = (autoswitch_now() == "false" and not os.path.exists(MANUAL_FLAG))
+    if locked:
+        log("startup: found a stale call lock -> will release after grace if mic is idle")
+    last_seen = time.time()
+    last_a2dp = {}    # card -> last A2DP profile seen there, restored after a call
+    parent = os.getppid()
+    while True:
+        time.sleep(POLL)
+        # The panel spawns this process. If the shell went away the parent
+        # changes, and a watchdog nobody can stop is worse than none.
+        if os.getppid() != parent:
+            log("parent shell is gone -> exiting")
+            return
+        card = current_card()
+        prof = profile(card)
+        if prof is None:
+            # A single failed read is not "disconnected". While SCO tears down,
+            # PipeWire marks the node as error and the profile is unreadable for
+            # a second or two; unlocking then creates exactly the profile
+            # flapping this daemon exists to remove. Only repeated misses count.
+            misses += 1
+            if misses >= 3 and locked:
+                log("headphones really gone (3 misses) -> unlock")
+                set_autoswitch(autoswitch_saved() or "true")
+                locked = False
+            continue
+        misses = 0
+        if prof.startswith("a2dp-sink"):
+            last_a2dp[card] = prof
+        if os.path.exists(MANUAL_FLAG):    # bt-call locked a mode by hand; stay out
+            continue
+        d = dump()
+        users = mic_users(d, card)
+        now = time.time()
+        if users:
+            last_seen = now
+            if not locked:
+                log(f"mic in use by {users} -> LOCK call profile")
+                set_autoswitch("false")
+                if not (profile(card) or "").startswith("headset-head-unit"):
+                    set_profile(card, "headset-head-unit")
+                locked = True
+            elif not (profile(card) or "").startswith("headset-head-unit"):
+                # headset-head-unit = mSBC, headset-head-unit-cvsd = CVSD (the
+                # escape hatch in the panel); both are calls.
+                log("profile drifted -> re-pin headset-head-unit")
+                set_profile(card, "headset-head-unit")
+        elif locked and (now - last_seen) >= HOLD_SECS:
+            home = a2dp_home(card, last_a2dp.get(card))
+            log(f"mic idle {HOLD_SECS}s -> UNLOCK, back to {home}")
+            set_autoswitch(autoswitch_saved() or "true")
+            set_profile(card, home)
+            locked = False
+
+
+if __name__ == "__main__":
+    lock = take_singleton_lock()
+    if lock is None:
+        log("another watchdog is already running -> exiting")
+        sys.exit(0)
+    write_pid()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        clear_pid()
